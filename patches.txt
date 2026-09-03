@@ -1,0 +1,3 @@
+eliways_jobs.patches.v0_1.add_last_sent_to_job_alert
+eliways_jobs.patches.v0_2.add_portal_indexes
+eliways_jobs.patches.v0_3.create_resource_doctypes
