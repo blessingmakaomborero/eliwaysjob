@@ -514,9 +514,8 @@ def get_employer_profiles(status: str = "", search: str = "", limit: int = 200) 
         filters=filters,
         fields=[
             "name", "user", "company_name", "email", "phone",
-            "industry", "city", "country", "website",
+            "industry", "city", "country",
             "verification_status", "creation",
-            "verification_date", "verified_by",
             "onboarding_completed", "onboarding_step",
         ],
         order_by="creation desc",
@@ -538,10 +537,8 @@ def update_employer_verification(profile_name: str, status: str, notes: str = ""
     doc = frappe.get_doc("Employer Profile", profile_name, ignore_permissions=True)
     doc.verification_status = status
     if notes:
-        doc.verification_notes = notes
-    if status == "Verified":
-        doc.verification_date = frappe.utils.today()
-        doc.verified_by = frappe.session.user
+        # Store notes in a field that exists — company_description or just log it
+        frappe.logger("eliways_jobs").info(f"[verify] {profile_name} → {status}: {notes}")
     doc.save(ignore_permissions=True)
     frappe.db.commit()
 
