@@ -494,3 +494,84 @@ def get_resource_stats() -> dict:
         "top_downloads":        downloads_by_item,
         "sponsored_articles":   sponsored_count,
     }
+
+
+@frappe.whitelist(allow_guest=False)
+def get_employer_profiles(status: str = "", search: str = "", limit: int = 200) -> list:
+    """
+    Return employer profiles for the admin verification page.
+    Uses ignore_permissions=True so the admin API token can read the
+    custom DocType without requiring explicit DocType-level permissions.
+    """
+    filters = []
+    if status:
+        filters.append(["verification_status", "=", status])
+    if search:
+        filters.append(["company_name", "like", f"%{search}%"])
+
+    return frappe.get_list(
+        "Employer Profile",
+        filters=filters,
+        fields=[
+            "name", "user", "company_name", "email", "phone",
+            "industry", "city", "country", "website",
+            "verification_status", "creation",
+            "verification_date", "verified_by",
+            "onboarding_completed", "onboarding_step",
+        ],
+        order_by="creation desc",
+        limit=int(limit),
+        ignore_permissions=True,
+    )
+
+
+@frappe.whitelist(allow_guest=False)
+def update_employer_verification(profile_name: str, status: str, notes: str = "") -> dict:
+    """
+    Update an employer's verification status.
+    Called by the admin verify endpoint.
+    """
+    allowed = {"Pending", "Verified", "Rejected", "Suspended"}
+    if status not in allowed:
+        frappe.throw(f"Invalid status: {status}")
+
+    doc = frappe.get_doc("Employer Profile", profile_name, ignore_permissions=True)
+    doc.verification_status = status
+    if notes:
+        doc.verification_notes = notes
+    if status == "Verified":
+        doc.verification_date = frappe.utils.today()
+        doc.verified_by = frappe.session.user
+    doc.save(ignore_permissions=True)
+    frappe.db.commit()
+
+    # Update the linked Frappe User role if verified/rejected
+    if doc.user:
+        try:
+            user = frappe.get_doc("User", doc.user)
+            if status == "Verified":
+                roles = [r.role for r in user.roles]
+                if "Employer Manager" not in roles:
+                    user.append("roles", {"role": "Employer Manager"})
+                    user.save(ignore_permissions=True)
+            elif status in ("Rejected", "Suspended"):
+                user.roles = [r for r in user.roles if r.role not in ("Employer Manager",)]
+                user.save(ignore_permissions=True)
+            frappe.db.commit()
+        except Exception as e:
+            frappe.logger("eliways_jobs").error(f"[update_employer_verification] role update failed: {e}")
+
+    return {"status": status, "profile": profile_name}
+
+
+@frappe.whitelist(allow_guest=False)
+def create_portal_notification(user: str, subject: str, message: str,
+                                ntype: str = "info", link: str = "") -> dict:
+    """Create a Portal Notification record."""
+    try:
+        from eliways_jobs.utils import create_portal_notification as _create
+        _create(user=user, subject=subject, message=message, ntype=ntype, link=link)
+        return {"created": True}
+    except Exception as e:
+        frappe.logger("eliways_jobs").error(f"[create_portal_notification] {e}")
+        return {"created": False, "error": str(e)}
