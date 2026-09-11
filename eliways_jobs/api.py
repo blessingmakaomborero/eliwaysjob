@@ -587,3 +587,35 @@ def create_portal_notification(user: str, subject: str, message: str,
     except Exception as e:
         frappe.logger("eliways_jobs").error(f"[create_portal_notification] {e}")
         return {"created": False, "error": str(e)}
+
+
+@frappe.whitelist(allow_guest=False)
+def create_employer_profile(user: str, company_name: str, email: str,
+                             phone: str = "", industry: str = "",
+                             website: str = "", country: str = "",
+                             city: str = "") -> dict:
+    """
+    Create an Employer Profile using direct SQL to avoid the DocType
+    controller import error on custom=1 DocTypes.
+    Idempotent — skips if profile already exists for this user.
+    """
+    existing = frappe.db.sql(
+        "SELECT name FROM `tabEmployer Profile` WHERE user = %s LIMIT 1",
+        (user,)
+    )
+    if existing:
+        return {"name": existing[0][0], "created": False}
+
+    import secrets as _secrets
+    name = _secrets.token_urlsafe(8)
+    frappe.db.sql(
+        """INSERT INTO `tabEmployer Profile`
+           (name, owner, creation, modified, modified_by, docstatus,
+            user, company_name, email, phone, industry, website,
+            country, city, verification_status, onboarding_completed, onboarding_step)
+           VALUES (%s, 'Administrator', NOW(), NOW(), 'Administrator', 0,
+                   %s, %s, %s, %s, %s, %s, %s, %s, 'Pending', 0, 1)""",
+        (name, user, company_name, email, phone, industry, website, country, city)
+    )
+    frappe.db.commit()
+    return {"name": name, "created": True}
