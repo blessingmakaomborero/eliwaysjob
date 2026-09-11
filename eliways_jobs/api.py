@@ -680,3 +680,58 @@ def update_employer_profile(user: str, data: dict) -> dict:
     )
     frappe.db.commit()
     return {"updated": len(safe), "profile": profile_name}
+
+
+@frappe.whitelist(allow_guest=False)
+def backfill_employer_companies() -> dict:
+    """
+    One-time fix: for every Employer Profile where company IS NULL but
+    company_name is set, find or create the matching Frappe Company and
+    link it back. Called once after migration to fix legacy profiles.
+    """
+    profiles = frappe.db.sql(
+        "SELECT name, user, company_name, country, industry "
+        "FROM `tabEmployer Profile` "
+        "WHERE (company IS NULL OR company = '') AND company_name IS NOT NULL AND company_name != ''",
+        as_dict=True,
+    )
+    fixed = 0
+    for p in profiles:
+        company_name = p.get("company_name", "")
+        if not company_name:
+            continue
+        # Find existing company
+        existing = frappe.db.sql(
+            "SELECT name FROM `tabCompany` WHERE company_name = %s LIMIT 1",
+            (company_name,), as_dict=True
+        )
+        if existing:
+            co_name = existing[0]["name"]
+        else:
+            # Create it
+            abbr = "".join(w[0] for w in company_name.split() if w).upper()[:5] or "CO"
+            try:
+                co = frappe.get_doc({
+                    "doctype": "Company",
+                    "company_name": company_name,
+                    "abbr": abbr,
+                    "country": p.get("country") or "Zimbabwe",
+                    "default_currency": "USD",
+                    "domain": p.get("industry") or "Services",
+                })
+                co.insert(ignore_permissions=True)
+                frappe.db.commit()
+                co_name = co.name
+            except Exception as e:
+                frappe.logger("eliways_jobs").error(f"[backfill] Company create failed for {company_name}: {e}")
+                continue
+
+        frappe.db.sql(
+            "UPDATE `tabEmployer Profile` SET company = %s, modified = NOW() WHERE name = %s",
+            (co_name, p["name"])
+        )
+        fixed += 1
+
+    frappe.db.commit()
+    frappe.logger("eliways_jobs").info(f"[backfill_employer_companies] Fixed {fixed} profiles")
+    return {"fixed": fixed}
