@@ -619,3 +619,64 @@ def create_employer_profile(user: str, company_name: str, email: str,
     )
     frappe.db.commit()
     return {"name": name, "created": True}
+
+
+@frappe.whitelist(allow_guest=False)
+def get_employer_profile_by_user(user: str) -> dict:
+    """
+    Fetch a single Employer Profile by user email using direct SQL.
+    Returns all columns so the onboarding wizard can pre-fill from
+    data saved during registration (company_name, industry, country, city).
+    """
+    rows = frappe.db.sql(
+        "SELECT * FROM `tabEmployer Profile` WHERE user = %s LIMIT 1",
+        (user,), as_dict=True
+    )
+    if not rows:
+        return {}
+    profile = dict(rows[0])
+    # Convert datetime objects to strings for JSON serialisation
+    for k, v in profile.items():
+        if hasattr(v, 'isoformat'):
+            profile[k] = v.isoformat()
+    return profile
+
+
+@frappe.whitelist(allow_guest=False)
+def update_employer_profile(user: str, data: dict) -> dict:
+    """
+    Update an Employer Profile by user email using direct SQL SET.
+    Ignores protected system fields. Creates the profile if it doesn't exist.
+    """
+    PROTECTED = {
+        'name', 'owner', 'creation', 'modified', 'modified_by',
+        'docstatus', 'idx', 'user',
+    }
+
+    existing = frappe.db.sql(
+        "SELECT name FROM `tabEmployer Profile` WHERE user = %s LIMIT 1",
+        (user,)
+    )
+    if not existing:
+        return {"error": "Profile not found for user: " + user}
+
+    profile_name = existing[0][0]
+    safe = {k: v for k, v in data.items() if k not in PROTECTED}
+
+    if not safe:
+        return {"updated": 0}
+
+    # Build SET clause
+    set_parts = []
+    values = []
+    for k, v in safe.items():
+        set_parts.append(f"`{k}` = %s")
+        values.append(v)
+
+    values.append(profile_name)
+    frappe.db.sql(
+        f"UPDATE `tabEmployer Profile` SET {', '.join(set_parts)}, modified = NOW() WHERE name = %s",
+        values
+    )
+    frappe.db.commit()
+    return {"updated": len(safe), "profile": profile_name}
