@@ -528,33 +528,48 @@ def get_employer_profiles(status: str = "", search: str = "", limit: int = 200) 
 def update_employer_verification(profile_name: str, status: str, notes: str = "") -> dict:
     """
     Update an employer's verification status.
-    Called by the admin verify endpoint.
+    Uses direct SQL to avoid the DocType controller import error
+    on custom=1 DocTypes that don't have a Python controller class.
     """
     allowed = {"Pending", "Verified", "Rejected", "Suspended"}
     if status not in allowed:
         frappe.throw(f"Invalid status: {status}")
 
-    doc = frappe.get_doc("Employer Profile", profile_name, ignore_permissions=True)
-    doc.verification_status = status
-    if notes:
-        # Store notes in a field that exists — company_description or just log it
-        frappe.logger("eliways_jobs").info(f"[verify] {profile_name} → {status}: {notes}")
-    doc.save(ignore_permissions=True)
+    # Use direct SQL to avoid 'No module named frappe.core.doctype.employer_profile'
+    # which occurs when frappe.get_doc tries to load a Python controller for a custom DocType
+    exists = frappe.db.sql(
+        "SELECT name, user FROM `tabEmployer Profile` WHERE name = %s",
+        (profile_name,), as_dict=True
+    )
+    if not exists:
+        frappe.throw(f"Employer Profile not found: {profile_name}")
+
+    employer = exists[0]
+
+    frappe.db.sql(
+        "UPDATE `tabEmployer Profile` SET verification_status = %s, modified = NOW() WHERE name = %s",
+        (status, profile_name)
+    )
     frappe.db.commit()
 
-    # Update the linked Frappe User role if verified/rejected
-    if doc.user:
+    if notes:
+        frappe.logger("eliways_jobs").info(f"[verify] {profile_name} → {status}: {notes}")
+
+    # Update User role
+    user_email = employer.get("user", "")
+    if user_email:
         try:
-            user = frappe.get_doc("User", doc.user)
+            user = frappe.get_doc("User", user_email)
+            current_roles = [r.role for r in user.roles]
             if status == "Verified":
-                roles = [r.role for r in user.roles]
-                if "Employer Manager" not in roles:
+                if "Employer Manager" not in current_roles:
                     user.append("roles", {"role": "Employer Manager"})
                     user.save(ignore_permissions=True)
+                    frappe.db.commit()
             elif status in ("Rejected", "Suspended"):
                 user.roles = [r for r in user.roles if r.role not in ("Employer Manager",)]
                 user.save(ignore_permissions=True)
-            frappe.db.commit()
+                frappe.db.commit()
         except Exception as e:
             frappe.logger("eliways_jobs").error(f"[update_employer_verification] role update failed: {e}")
 
