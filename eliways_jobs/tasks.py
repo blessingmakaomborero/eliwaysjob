@@ -29,7 +29,9 @@ send_job_alerts (Daily / Weekly):
 """
 import frappe
 from frappe.utils import today, add_days
-from eliways_jobs.utils import safe_log, send_portal_email
+from eliways_jobs.utils import (
+    create_portal_notification, hiring_context, recruitment_recipients, safe_log, send_portal_email,
+)
 
 
 # ─── Task 1: Auto-close expired Job Openings ──────────────────────────────────
@@ -53,6 +55,7 @@ def close_expired_jobs():
             limit=500,  # raised from 200; index scan keeps this fast
         )
 
+        warn_expiring_jobs()
         if not expired:
             frappe.logger("eliways_jobs").info("[close_expired_jobs] Nothing to close.")
             return
@@ -64,6 +67,7 @@ def close_expired_jobs():
                 doc.status = "Closed"
                 doc.save(ignore_permissions=True)
                 closed_names.append(job["name"])
+                _notify_job_closed(job)
                 frappe.logger("eliways_jobs").info(
                     f"[close_expired_jobs] Closed: {job['name']} ({job['job_title']})"
                 )
@@ -77,6 +81,57 @@ def close_expired_jobs():
         )
     except Exception as e:
         safe_log("close_expired_jobs", e)
+
+
+def warn_expiring_jobs():
+    """Tell the hiring company when an open vacancy closes within three days."""
+    soon = add_days(today(), 3)
+    opening = frappe.get_list(
+        "Job Opening",
+        filters=[
+            ["status", "=", "Open"],
+            ["closes_on", ">=", today()],
+            ["closes_on", "<=", soon],
+        ],
+        fields=["name", "job_title", "company", "closes_on"],
+        limit=200,
+    )
+    for job in opening:
+        ctx = hiring_context(job.name)
+        subject = f"Vacancy closing soon – {job.job_title}"
+        message = (
+            f"<strong>{job.job_title}</strong> at <strong>{ctx['company_name']}</strong> "
+            f"closes on {job.closes_on}."
+        )
+        for email in recruitment_recipients(job.company, "application"):
+            create_portal_notification(
+                user=email, subject=subject, message=message, ntype="info",
+                link=f"/employer/jobs/{job.name}/edit", company=job.company,
+                reference_doctype="Job Opening", reference_name=job.name,
+            )
+            send_portal_email(
+                to=email, subject=subject, template="job_expiring",
+                context={**ctx, "closes_on": str(job.closes_on), "portal_link": f"/employer/jobs/{job.name}/edit"},
+            )
+
+
+def _notify_job_closed(job):
+    ctx = hiring_context(job["name"])
+    subject = f"Vacancy closed – {job['job_title']}"
+    message = (
+        f"<strong>{job['job_title']}</strong> at <strong>{ctx['company_name']}</strong> "
+        f"was closed because the closing date {job['closes_on']} has passed."
+    )
+    for email in recruitment_recipients(job["company"], "application"):
+        create_portal_notification(
+            user=email, subject=subject, message=message, ntype="info",
+            link="/employer/jobs", company=job["company"],
+            reference_doctype="Job Opening", reference_name=job["name"],
+        )
+        send_portal_email(
+            to=email, subject=subject, template="job_expiring",
+            context={**ctx, "closes_on": str(job["closes_on"]), "message": message, "portal_link": "/employer/jobs"},
+        )
 
 
 # ─── Task 2: Daily / Weekly job alert digests ─────────────────────────────────

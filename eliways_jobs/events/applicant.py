@@ -3,60 +3,69 @@ Job Applicant event hooks.
 Fires Portal Notifications and email alerts without touching HRMS core.
 """
 import frappe
-from eliways_jobs.utils import create_portal_notification, send_portal_email, safe_log
+from eliways_jobs.utils import (
+    create_portal_notification, hiring_context, recruitment_recipients,
+    send_portal_email, safe_log,
+)
 
 
 def after_insert(doc, method=None):
     """Candidate applied → notify candidate + employer."""
     try:
         # ── Candidate confirmation ─────────────────────────────────────────
+        ctx = hiring_context(doc.job_title)
+        company = ctx["hiring_company"]
+        title = ctx["job_title"]
         candidate_email = doc.email_id or ""
         if candidate_email:
             create_portal_notification(
                 user=candidate_email,
-                subject="Application Received",
+                subject=f"Application Received – {title}",
                 message=(
-                    f"Your application for <strong>{doc.job_title}</strong> has been received. "
-                    "We will review it and be in touch."
+                    f"Your application for <strong>{title}</strong> at "
+                    f"<strong>{ctx['company_name']}</strong> has been received."
                 ),
                 ntype="success",
                 link=f"/candidate/applications/{doc.name}",
+                company=company,
+                reference_doctype="Job Applicant",
+                reference_name=doc.name,
             )
             send_portal_email(
                 to=candidate_email,
-                subject=f"Application Confirmed – {doc.job_title}",
+                subject=f"Application Confirmed – {title}",
                 template="application_confirmation",
                 context={
+                    **ctx,
                     "candidate_name": doc.applicant_name or candidate_email,
-                    "job_title":      doc.job_title,
-                    "company":        _get_job_company(doc.job_title),
                     "application_date": frappe.utils.today(),
-                    "portal_link":    f"{frappe.conf.get('portal_url','')}/candidate/applications/{doc.name}",
+                    "portal_link": f"{frappe.conf.get('portal_url','')}/candidate/applications/{doc.name}",
                 },
             )
 
-        # ── Employer new applicant notification ────────────────────────────
-        employer_emails = _get_employer_emails(doc.job_title)
-        for emp_email in employer_emails:
+        for emp_email in recruitment_recipients(company, "application"):
             create_portal_notification(
                 user=emp_email,
-                subject="New Applicant",
+                subject=f"New Applicant – {title}",
                 message=(
                     f"<strong>{doc.applicant_name}</strong> applied for "
-                    f"<strong>{doc.job_title}</strong>."
+                    f"<strong>{title}</strong> at <strong>{ctx['company_name']}</strong>."
                 ),
                 ntype="info",
                 link=f"/employer/jobs/{doc.job_title}/applicants",
+                company=company,
+                reference_doctype="Job Applicant",
+                reference_name=doc.name,
             )
             send_portal_email(
                 to=emp_email,
-                subject=f"New Application – {doc.job_title}",
+                subject=f"New Application – {title}",
                 template="new_applicant",
                 context={
+                    **ctx,
                     "candidate_name": doc.applicant_name,
-                    "job_title":      doc.job_title,
                     "application_date": frappe.utils.today(),
-                    "portal_link":    f"{frappe.conf.get('portal_url','')}/employer/jobs/{frappe.utils.scrub(doc.job_title)}/applicants",
+                    "portal_link": f"{frappe.conf.get('portal_url','')}/employer/jobs/{doc.job_title}/applicants",
                 },
             )
     except Exception as e:
@@ -81,23 +90,30 @@ def on_update(doc, method=None):
     candidate_email = doc.email_id or ""
     if candidate_email:
         try:
+            ctx = hiring_context(doc.job_title)
+            company = ctx["hiring_company"]
+            title = ctx["job_title"] or doc.job_title
             create_portal_notification(
                 user=candidate_email,
-                subject=f"Application Update – {doc.job_title}",
+                subject=f"Application Update – {title}",
                 message=msg,
                 ntype=ntype,
                 link=f"/candidate/applications/{doc.name}",
+                company=company,
+                reference_doctype="Job Applicant",
+                reference_name=doc.name,
             )
             send_portal_email(
                 to=candidate_email,
-                subject=f"Application Update – {doc.job_title}",
+                subject=f"Application Update – {title}",
                 template="application_status_change",
                 context={
+                    **ctx,
                     "candidate_name": doc.applicant_name or candidate_email,
-                    "job_title":      doc.job_title,
+                    "job_title":      title,
                     "status":         doc.status,
                     "message":        msg,
-                    "portal_link":    f"{frappe.conf.get('portal_url','')}/candidate/applications/{doc.name}",
+                    "portal_link":    f"/candidate/applications/{doc.name}",
                 },
             )
         except Exception as e:
@@ -106,25 +122,3 @@ def on_update(doc, method=None):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _get_job_company(job_title: str) -> str:
-    try:
-        return frappe.db.get_value("Job Opening", job_title, "company") or ""
-    except Exception:
-        return ""
-
-
-def _get_employer_emails(job_title: str) -> list:
-    """Return email addresses of Employer Recruiter users for this job's company."""
-    try:
-        company = _get_job_company(job_title)
-        if not company:
-            return []
-        profiles = frappe.get_list(
-            "Employer Profile",
-            filters={"company": company},
-            fields=["user"],
-            limit=10,
-        )
-        return [p.user for p in profiles if p.user]
-    except Exception:
-        return []

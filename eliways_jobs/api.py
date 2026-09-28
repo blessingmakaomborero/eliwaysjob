@@ -37,6 +37,7 @@ def get_job_counts_by_company(companies: list) -> dict:
         FROM   `tabJob Opening`
         WHERE  status = 'Open'
           AND  company IN ({placeholders})
+          AND  job_title NOT REGEXP '^(Suite Verified Job|Company A Job|Company B Job|E2E |Test Job|BFF Test|Expiry Test)'
         GROUP  BY company
         """.format(placeholders=placeholders),
         tuple(companies),
@@ -51,10 +52,22 @@ def get_portal_stats() -> dict:
     Return platform-level counts in a single DB round-trip each (index-only reads).
     Called by the /api/jobs/stats BFF route.
     """
-    active_jobs = frappe.db.count("Job Opening", filters={"status": "Open"})
-    total_apps  = frappe.db.count("Job Applicant")
-    employers   = frappe.db.count("Company")
-    candidates  = frappe.db.count("Candidate Profile")
+    active_jobs = frappe.db.sql(
+        """
+        SELECT COUNT(*) FROM `tabJob Opening`
+        WHERE status = 'Open'
+          AND job_title NOT REGEXP '^(Suite Verified Job|Company A Job|Company B Job|E2E |Test Job|BFF Test|Expiry Test)'
+        """
+    )[0][0]
+    total_apps = frappe.db.count("Job Applicant")
+    employers = frappe.db.sql(
+        """
+        SELECT COUNT(*) FROM `tabCompany`
+        WHERE name NOT REGEXP '^Test Corp'
+          AND name != 'hr test'
+        """
+    )[0][0]
+    candidates = frappe.db.count("Candidate Profile")
     return {
         "activeJobs":   active_jobs,
         "applications": total_apps,
@@ -277,6 +290,14 @@ def initiate_payment(download_name: str, user_email: str, payment_method: str = 
             return {"status": "paid", "download_token": token, "expires": str(expires)}
         return {"status": "paid", "download_token": rec["download_token"]}
 
+    integration_id = frappe.conf.get("paynow_integration_id") or ""
+    integration_key = frappe.conf.get("paynow_integration_key") or ""
+    if not integration_id or not integration_key:
+        return {
+            "status": "not_configured",
+            "message": "Card payments are not available yet. Paynow credentials are not set on this site.",
+        }
+
     # ── Create pending payment record ─────────────────────────────────────
     pay = frappe.get_doc({
         "doctype":        "Resource Payment",
@@ -409,13 +430,7 @@ def _initiate_paynow(payment_name: str, email: str, amount: float, description: 
         portal_url      = frappe.conf.get("portal_url", "http://localhost:3000")
 
         if not integration_id or not integration_key:
-            frappe.logger("eliways_jobs").warning(
-                "[paynow] No credentials configured — returning mock response"
-            )
-            return {
-                "redirect_url": f"{portal_url}/career-resources/downloads/pending?ref={payment_name}",
-                "poll_url": "",
-            }
+            return {"error": "not_configured", "redirect_url": "", "poll_url": ""}
 
         return_url = f"{portal_url}/career-resources/downloads/complete?ref={payment_name}"
         result_url = f"{portal_url}/api/jobs/resources/paynow-callback"
@@ -525,7 +540,7 @@ def get_employer_profiles(status: str = "", search: str = "", limit: int = 200) 
 
 
 @frappe.whitelist(allow_guest=False)
-def update_employer_verification(profile_name: str, status: str, notes: str = "") -> dict:
+def update_employer_verification(profile_name: str, status: str, notes: str = "", verified_by: str = "") -> dict:
     """
     Update an employer's verification status.
     Uses direct SQL to avoid the DocType controller import error
@@ -538,7 +553,7 @@ def update_employer_verification(profile_name: str, status: str, notes: str = ""
     # Use direct SQL to avoid 'No module named frappe.core.doctype.employer_profile'
     # which occurs when frappe.get_doc tries to load a Python controller for a custom DocType
     exists = frappe.db.sql(
-        "SELECT name, user FROM `tabEmployer Profile` WHERE name = %s",
+        "SELECT name, user, email, company_name, company FROM `tabEmployer Profile` WHERE name = %s",
         (profile_name,), as_dict=True
     )
     if not exists:
@@ -546,10 +561,22 @@ def update_employer_verification(profile_name: str, status: str, notes: str = ""
 
     employer = exists[0]
 
-    frappe.db.sql(
-        "UPDATE `tabEmployer Profile` SET verification_status = %s, modified = NOW() WHERE name = %s",
-        (status, profile_name)
-    )
+    if status == "Verified":
+        from eliways_jobs.employer_review import assert_subscription_paid
+        assert_subscription_paid(profile_name)
+
+    if status == "Verified":
+        frappe.db.sql(
+            """UPDATE `tabEmployer Profile`
+               SET verification_status = %s, verification_date = NOW(), verified_by = %s, modified = NOW()
+               WHERE name = %s""",
+            (status, verified_by or frappe.session.user, profile_name),
+        )
+    else:
+        frappe.db.sql(
+            "UPDATE `tabEmployer Profile` SET verification_status = %s, modified = NOW() WHERE name = %s",
+            (status, profile_name),
+        )
     frappe.db.commit()
 
     if notes:
@@ -573,7 +600,125 @@ def update_employer_verification(profile_name: str, status: str, notes: str = ""
         except Exception as e:
             frappe.logger("eliways_jobs").error(f"[update_employer_verification] role update failed: {e}")
 
+    _notify_verification(employer, status)
     return {"status": status, "profile": profile_name}
+
+
+def _notify_verification(employer, status):
+    """In-portal notice and email. The profile update is SQL, so the document hook does not run."""
+    messages = {
+        "Verified": "Your company has been verified. You can now publish job openings.",
+        "Rejected": "Your company verification was not approved. Please contact support.",
+        "Suspended": "Your employer account has been suspended. New recruitment actions are disabled.",
+        "Pending": "Your company verification status has been reset to Pending.",
+    }
+    recipient = employer.get("user") or employer.get("email") or ""
+    if not recipient:
+        return
+    message = messages.get(status, "Your verification status has been updated.")
+    company_name = employer.get("company_name") or employer.get("company") or ""
+    try:
+        from eliways_jobs.utils import create_portal_notification, send_portal_email
+        create_portal_notification(
+            user=recipient,
+            subject=f"Company Verification: {status}",
+            message=message,
+            ntype="success" if status == "Verified" else "error" if status in ("Rejected", "Suspended") else "info",
+            link="/employer/dashboard",
+            company=employer.get("company") or "",
+            reference_doctype="Employer Profile",
+            reference_name=employer.get("name") or "",
+        )
+        send_portal_email(
+            to=recipient,
+            subject=f"Company Verification Update – {status}",
+            template="employer_verification",
+            context={
+                "company_name": company_name,
+                "status": status,
+                "message": message,
+                "portal_link": "/employer/dashboard",
+            },
+        )
+    except Exception as e:
+        frappe.logger("eliways_jobs").error(f"[update_employer_verification] notify failed: {e}")
+
+
+@frappe.whitelist(allow_guest=False)
+def company_recruiters(company):
+    """Users who may be assigned as interviewers for this company."""
+    company = (company or "").strip()
+    if not company:
+        return []
+    people = []
+    seen = set()
+    owners = frappe.db.sql(
+        """SELECT user, primary_recruiter_name, company_name
+           FROM `tabEmployer Profile` WHERE company = %s""",
+        (company,), as_dict=True,
+    )
+    for row in owners:
+        email = (row.user or "").strip()
+        if email and email not in seen:
+            seen.add(email)
+            people.append({
+                "user": email,
+                "name": row.primary_recruiter_name or row.company_name or email,
+                "role": "Employer Owner",
+            })
+    members = frappe.db.sql(
+        """SELECT user, member_role FROM `tabEmployer Membership`
+           WHERE company = %s AND status = 'Active'""",
+        (company,), as_dict=True,
+    )
+    for row in members:
+        email = (row.user or "").strip()
+        if email and email not in seen:
+            seen.add(email)
+            people.append({"user": email, "name": email, "role": row.member_role or "Recruiter"})
+    return people
+
+
+@frappe.whitelist(allow_guest=False)
+def interview_assignees(interviews):
+    """Interview Detail rows for the given interview names. Child tables are not listed reliably over REST."""
+    if isinstance(interviews, str):
+        import json
+        interviews = json.loads(interviews or "[]")
+    names = [name for name in (interviews or []) if name]
+    if not names:
+        return []
+    return frappe.db.sql(
+        """SELECT parent, interviewer FROM `tabInterview Detail`
+           WHERE parent IN ({placeholders})""".format(
+            placeholders=", ".join(["%s"] * len(names))
+        ),
+        tuple(names),
+        as_dict=True,
+    )
+
+
+@frappe.whitelist(allow_guest=False)
+def ensure_interview_cancelled_status():
+    """Add Cancelled to Interview status without editing the HRMS app."""
+    options = "Pending\nUnder Review\nCleared\nRejected\nCancelled"
+    current = frappe.db.get_value(
+        "Property Setter",
+        {"doc_type": "Interview", "field_name": "status", "property": "options"},
+        "value",
+    )
+    if current == options:
+        return options
+    previous = frappe.session.user
+    frappe.set_user("Administrator")
+    try:
+        from frappe.custom.doctype.property_setter.property_setter import make_property_setter
+        make_property_setter("Interview", "status", "options", options, "Text", validate_fields_for_doctype=False)
+        frappe.db.commit()
+    finally:
+        frappe.set_user(previous)
+    frappe.clear_cache(doctype="Interview")
+    return options
 
 
 @frappe.whitelist(allow_guest=False)
@@ -606,19 +751,118 @@ def create_employer_profile(user: str, company_name: str, email: str,
     if existing:
         return {"name": existing[0][0], "created": False}
 
+    duplicate, reason = _probable_duplicate(company_name, email)
+    _ensure_duplicate_flag()
+
     import secrets as _secrets
     name = _secrets.token_urlsafe(8)
     frappe.db.sql(
         """INSERT INTO `tabEmployer Profile`
            (name, owner, creation, modified, modified_by, docstatus,
             user, company_name, email, phone, industry, website,
-            country, city, verification_status, onboarding_completed, onboarding_step)
+            country, city, verification_status, onboarding_completed, onboarding_step,
+            duplicate_flag, duplicate_reason)
            VALUES (%s, 'Administrator', NOW(), NOW(), 'Administrator', 0,
-                   %s, %s, %s, %s, %s, %s, %s, %s, 'Pending', 0, 1)""",
-        (name, user, company_name, email, phone, industry, website, country, city)
+                   %s, %s, %s, %s, %s, %s, %s, %s, 'Pending', 0, 1, %s, %s)""",
+        (name, user, company_name, email, phone, industry, website, country, city, duplicate, reason)
     )
     frappe.db.commit()
-    return {"name": name, "created": True}
+    return {"name": name, "created": True, "duplicate_flag": duplicate, "duplicate_reason": reason}
+
+
+@frappe.whitelist(allow_guest=False)
+def ensure_job_offer_fields():
+    """Store portal offer details on the HRMS Job Offer without editing HRMS."""
+    previous = frappe.session.user
+    frappe.set_user("Administrator")
+    try:
+        fields = [
+            {
+                "fieldname": "job_opening",
+                "label": "Job Opening",
+                "fieldtype": "Link",
+                "options": "Job Opening",
+                "insert_after": "job_applicant",
+            },
+            {
+                "fieldname": "date_of_joining",
+                "label": "Date of Joining",
+                "fieldtype": "Date",
+                "insert_after": "offer_date",
+            },
+            {
+                "fieldname": "currency",
+                "label": "Currency",
+                "fieldtype": "Link",
+                "options": "Currency",
+                "insert_after": "company",
+            },
+            {
+                "fieldname": "gross_salary",
+                "label": "Gross Salary",
+                "fieldtype": "Currency",
+                "insert_after": "currency",
+            },
+        ]
+        for field in fields:
+            if frappe.db.has_column("Job Offer", field["fieldname"]):
+                continue
+            frappe.get_doc({"doctype": "Custom Field", "dt": "Job Offer", **field}).insert(
+                ignore_permissions=True
+            )
+        frappe.db.commit()
+    finally:
+        frappe.set_user(previous)
+    return {"ok": True}
+
+
+def _ensure_duplicate_flag():
+    previous = frappe.session.user
+    frappe.set_user("Administrator")
+    try:
+        if not frappe.db.has_column("Employer Profile", "duplicate_flag"):
+            frappe.get_doc({
+                "doctype": "Custom Field",
+                "dt": "Employer Profile",
+                "fieldname": "duplicate_flag",
+                "label": "Probable Duplicate",
+                "fieldtype": "Check",
+                "insert_after": "verification_status",
+            }).insert(ignore_permissions=True)
+        if not frappe.db.has_column("Employer Profile", "duplicate_reason"):
+            frappe.get_doc({
+                "doctype": "Custom Field",
+                "dt": "Employer Profile",
+                "fieldname": "duplicate_reason",
+                "label": "Duplicate Reason",
+                "fieldtype": "Small Text",
+                "insert_after": "duplicate_flag",
+            }).insert(ignore_permissions=True)
+        frappe.db.commit()
+    finally:
+        frappe.set_user(previous)
+
+
+def _probable_duplicate(company_name, email):
+    """Flag a registration that matches another company's name or private email domain. Never merge."""
+    named = frappe.db.sql(
+        "SELECT name FROM `tabEmployer Profile` WHERE company_name = %s LIMIT 1",
+        (company_name,),
+    )
+    if named:
+        return 1, "Same company name as an existing employer. Review both records. Do not merge them."
+    domain = (email or "").split("@")[-1].lower()
+    public = {"gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "mail.test"}
+    if domain and domain not in public:
+        match = frappe.db.sql(
+            "SELECT company_name FROM `tabEmployer Profile` WHERE email LIKE %s LIMIT 1",
+            ("%@" + domain,),
+        )
+        if match:
+            return 1, "Email domain @{0} is already used by {1}. Review both records. Do not merge them.".format(
+                domain, match[0][0]
+            )
+    return 0, ""
 
 
 @frappe.whitelist(allow_guest=False)
@@ -661,7 +905,8 @@ def update_employer_profile(user: str, data: dict) -> dict:
         return {"error": "Profile not found for user: " + user}
 
     profile_name = existing[0][0]
-    safe = {k: v for k, v in data.items() if k not in PROTECTED}
+    columns = set(frappe.db.get_table_columns("Employer Profile"))
+    safe = {k: v for k, v in data.items() if k not in PROTECTED and k in columns}
 
     if not safe:
         return {"updated": 0}
@@ -680,6 +925,48 @@ def update_employer_profile(user: str, data: dict) -> dict:
     )
     frappe.db.commit()
     return {"updated": len(safe), "profile": profile_name}
+
+
+def _unique_company_abbr(company_name):
+    """Allocate an abbreviation that is not already used by another Company."""
+    words = [word for word in (company_name or "").split() if word]
+    base = "".join(word[0] for word in words).upper()[:5] or "CO"
+    if not frappe.db.exists("Company", {"abbr": base}):
+        return base
+    import hashlib
+    digest = hashlib.sha1(company_name.encode("utf-8")).hexdigest()[:4].upper()
+    for index in range(36):
+        suffix = digest if index == 0 else digest[:3] + format(index, "X")
+        candidate = (base[:1] + suffix)[:5]
+        if not frappe.db.exists("Company", {"abbr": candidate}):
+            return candidate
+    frappe.throw("Could not allocate a unique company abbreviation.")
+
+
+@frappe.whitelist(allow_guest=False)
+def ensure_portal_company(company_name, country="Zimbabwe", industry="Services"):
+    """
+    Return the ERPNext Company name for a portal employer.
+    Creates the company when it does not exist, with an abbreviation that
+    does not collide with an unrelated company.
+    """
+    company_name = (company_name or "").strip()
+    if not company_name:
+        frappe.throw("Company name is required.")
+    existing = frappe.db.get_value("Company", {"company_name": company_name}, "name")
+    if existing:
+        return existing
+    doc = frappe.get_doc({
+        "doctype": "Company",
+        "company_name": company_name,
+        "abbr": _unique_company_abbr(company_name),
+        "country": country or "Zimbabwe",
+        "default_currency": "USD",
+        "domain": industry or "Services",
+    })
+    doc.insert(ignore_permissions=True)
+    frappe.db.commit()
+    return doc.name
 
 
 @frappe.whitelist(allow_guest=False)
@@ -708,20 +995,12 @@ def backfill_employer_companies() -> dict:
         if existing:
             co_name = existing[0]["name"]
         else:
-            # Create it
-            abbr = "".join(w[0] for w in company_name.split() if w).upper()[:5] or "CO"
             try:
-                co = frappe.get_doc({
-                    "doctype": "Company",
-                    "company_name": company_name,
-                    "abbr": abbr,
-                    "country": p.get("country") or "Zimbabwe",
-                    "default_currency": "USD",
-                    "domain": p.get("industry") or "Services",
-                })
-                co.insert(ignore_permissions=True)
-                frappe.db.commit()
-                co_name = co.name
+                co_name = ensure_portal_company(
+                    company_name,
+                    p.get("country") or "Zimbabwe",
+                    p.get("industry") or "Services",
+                )
             except Exception as e:
                 frappe.logger("eliways_jobs").error(f"[backfill] Company create failed for {company_name}: {e}")
                 continue
@@ -735,3 +1014,247 @@ def backfill_employer_companies() -> dict:
     frappe.db.commit()
     frappe.logger("eliways_jobs").info(f"[backfill_employer_companies] Fixed {fixed} profiles")
     return {"fixed": fixed}
+
+
+# ─── Portal account ───────────────────────────────────────────────────────────
+
+_NOTIFY_FIELDS = ("notify_status", "notify_interviews", "notify_offers", "notify_alerts")
+
+
+def _ensure_notification_columns():
+    columns = {row[0] for row in frappe.db.sql("SHOW COLUMNS FROM `tabCandidate Profile`")}
+    for field in _NOTIFY_FIELDS:
+        if field not in columns:
+            frappe.db.sql(
+                f"ALTER TABLE `tabCandidate Profile` ADD COLUMN `{field}` int(1) NOT NULL DEFAULT 1"
+            )
+    frappe.db.commit()
+
+
+def _assert_portal_user(user_email: str):
+    if not user_email or user_email in ("Administrator", "Guest"):
+        frappe.throw("This account cannot be changed from the portal.")
+    if not frappe.db.exists("User", user_email):
+        frappe.throw("Account not found.")
+    if "System Manager" in frappe.get_roles(user_email):
+        frappe.throw("Administrator accounts must be changed from Frappe Desk.")
+
+
+@frappe.whitelist(allow_guest=False)
+def change_portal_password(user_email: str, old_password: str, new_password: str) -> dict:
+    """Verify the current password, then set a new one. Called by the portal BFF."""
+    _assert_portal_user(user_email)
+    if not old_password or not new_password:
+        frappe.throw("Current password and new password are required.")
+    if len(new_password) < 8:
+        frappe.throw("Password must be at least 8 characters.")
+    if old_password == new_password:
+        frappe.throw("Choose a password that is different from the current one.")
+
+    from frappe.utils.password import check_password, update_password
+
+    try:
+        check_password(user_email, old_password)
+    except frappe.AuthenticationError:
+        frappe.throw("Current password is incorrect.")
+
+    update_password(user_email, new_password, logout_all_sessions=False)
+    frappe.db.commit()
+    return {"ok": True}
+
+
+@frappe.whitelist(allow_guest=False)
+def deactivate_portal_account(user_email: str, password: str) -> dict:
+    """Disable a portal user after they confirm their password. Records stay in HRMS."""
+    _assert_portal_user(user_email)
+    if not password:
+        frappe.throw("Password is required.")
+
+    from frappe.utils.password import check_password
+
+    try:
+        check_password(user_email, password)
+    except frappe.AuthenticationError:
+        frappe.throw("Password is incorrect.")
+
+    frappe.db.set_value("User", user_email, "enabled", 0)
+    frappe.db.commit()
+    return {"ok": True}
+
+
+@frappe.whitelist(allow_guest=False)
+def get_notification_prefs(user_email: str) -> dict:
+    _assert_portal_user(user_email)
+    _ensure_notification_columns()
+    rows = frappe.db.sql(
+        """
+        SELECT notify_status, notify_interviews, notify_offers, notify_alerts
+        FROM `tabCandidate Profile`
+        WHERE user = %s
+        LIMIT 1
+        """,
+        user_email,
+        as_dict=True,
+    )
+    if not rows:
+        return {field: 1 for field in _NOTIFY_FIELDS}
+    return {field: int(rows[0].get(field) or 0) for field in _NOTIFY_FIELDS}
+
+
+@frappe.whitelist(allow_guest=False)
+def set_notification_prefs(user_email: str, prefs) -> dict:
+    _assert_portal_user(user_email)
+    _ensure_notification_columns()
+    if isinstance(prefs, str):
+        prefs = frappe.parse_json(prefs)
+    if not isinstance(prefs, dict):
+        frappe.throw("Preferences are required.")
+
+    values = {field: 1 if prefs.get(field) else 0 for field in _NOTIFY_FIELDS}
+    found = frappe.db.sql(
+        "SELECT name FROM `tabCandidate Profile` WHERE user = %s LIMIT 1",
+        user_email,
+    )
+    if not found:
+        frappe.throw("Create your candidate profile before changing notification settings.")
+    frappe.db.sql(
+        """
+        UPDATE `tabCandidate Profile`
+        SET notify_status = %s,
+            notify_interviews = %s,
+            notify_offers = %s,
+            notify_alerts = %s,
+            modified = NOW(6)
+        WHERE user = %s
+        """,
+        (
+            values["notify_status"],
+            values["notify_interviews"],
+            values["notify_offers"],
+            values["notify_alerts"],
+            user_email,
+        ),
+    )
+    frappe.db.commit()
+    return values
+
+
+@frappe.whitelist(allow_guest=True)
+def handle_paynow_callback(reference: str, amount: str = "", paynowreference: str = "",
+                           pollurl: str = "", status: str = "", hash: str = "") -> dict:
+    """
+    Paynow server-to-server result URL.
+    Rejects the call when the integration key is missing or the hash does not match.
+    """
+    import hashlib
+
+    integration_key = frappe.conf.get("paynow_integration_key") or ""
+    if not integration_key:
+        frappe.throw("Paynow is not configured.")
+    if not reference or not hash:
+        frappe.throw("Incomplete Paynow callback.")
+
+    payload = "".join([
+        reference or "",
+        amount or "",
+        paynowreference or "",
+        pollurl or "",
+        status or "",
+    ]) + integration_key
+    expected = hashlib.sha512(payload.encode()).hexdigest().upper()
+    if expected != (hash or "").upper():
+        frappe.throw("Hash mismatch.")
+
+    if not frappe.db.exists("Resource Payment", reference):
+        frappe.throw("Payment not found.")
+
+    normalised = (status or "").lower()
+    if normalised in ("paid", "awaiting delivery"):
+        token = secrets.token_urlsafe(32)
+        expires = datetime.utcnow() + timedelta(hours=24)
+        frappe.db.set_value("Resource Payment", reference, {
+            "status": "Paid",
+            "paid_at": datetime.utcnow(),
+            "download_token": token,
+            "token_expires": expires,
+            "paynow_status": normalised,
+            "paynow_ref": pollurl or "",
+        })
+    elif normalised in ("cancelled", "failed", "refunded"):
+        frappe.db.set_value("Resource Payment", reference, {
+            "status": "Failed",
+            "paynow_status": normalised,
+        })
+    frappe.db.commit()
+    return {"ok": True}
+
+
+@frappe.whitelist(allow_guest=False)
+def ensure_company_department(company, department_name):
+    """
+    Return the Department document name for a company.
+    Creates the department under the company root when the employer typed a new name.
+    """
+    label = (department_name or "").strip()
+    if not company or not label:
+        return ""
+    if frappe.db.exists("Department", label):
+        return label
+    abbr = frappe.db.get_value("Company", company, "abbr") or ""
+    named = "{0} - {1}".format(label, abbr) if abbr else label
+    if frappe.db.exists("Department", named):
+        return named
+    existing = frappe.db.get_value(
+        "Department", {"department_name": label, "company": company}, "name"
+    )
+    if existing:
+        return existing
+    root = frappe.db.get_value("Department", {"is_group": 1, "company": company}, "name")
+    doc = frappe.get_doc({
+        "doctype": "Department",
+        "department_name": label,
+        "company": company,
+        "parent_department": root,
+        "is_group": 0,
+    })
+    doc.insert(ignore_permissions=True)
+    frappe.db.commit()
+    return doc.name
+
+
+@frappe.whitelist(allow_guest=False)
+def ensure_interview_round(round_name="Screening", designation=None):
+    """
+    Return an Interview Round the HRMS Interview document can link to.
+    Creates a General skill and the round when they do not exist.
+    A round tied to a different designation gets a designation-specific name.
+    """
+    name = (round_name or "Screening").strip() or "Screening"
+    existing = frappe.db.get_value(
+        "Interview Round", name, ["name", "designation"], as_dict=True
+    )
+    if existing:
+        locked = existing.designation and designation and existing.designation != designation
+        if not locked:
+            return existing.name
+        name = "{0} — {1}".format(name, designation)
+        again = frappe.db.exists("Interview Round", name)
+        if again:
+            return again
+
+    if not frappe.db.exists("Skill", "General"):
+        frappe.get_doc({
+            "doctype": "Skill",
+            "skill_name": "General",
+            "description": "General screening skill",
+        }).insert(ignore_permissions=True)
+
+    doc = frappe.get_doc({
+        "doctype": "Interview Round",
+        "round_name": name,
+        "designation": designation or None,
+        "expected_skill_set": [{"skill": "General"}],
+    })
+    doc.insert(ignore_permissions=True)
+    frappe.db.commit()
+    return doc.name
