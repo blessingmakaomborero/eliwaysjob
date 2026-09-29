@@ -886,17 +886,60 @@ def get_employer_profile_by_user(user: str) -> dict:
     return profile
 
 
+PROFILE_COLUMNS = {
+    "company_description": "text",
+    "company_size": "varchar(140)",
+    "trading_name": "varchar(140)",
+    "registration_number": "varchar(140)",
+    "tax_id": "varchar(140)",
+    "company_type": "varchar(140)",
+    "year_established": "varchar(140)",
+    "primary_recruiter_name": "varchar(140)",
+    "primary_recruiter_title": "varchar(140)",
+    "primary_recruiter_email": "varchar(140)",
+    "primary_recruiter_phone": "varchar(140)",
+    "primary_recruiter_department": "varchar(140)",
+    "recruitment_email": "varchar(140)",
+    "cc_recruitment_emails": "text",
+    "reply_to_email": "varchar(140)",
+    "default_job_location": "varchar(140)",
+    "application_notify_emails": "text",
+    "interview_notify_emails": "text",
+    "offer_notify_emails": "text",
+    "logo": "varchar(255)",
+}
+
+
+def _ensure_profile_columns():
+    """The portal table was created without the onboarding columns. Add any that are missing."""
+    added = False
+    for field, column_type in PROFILE_COLUMNS.items():
+        if frappe.db.has_column("Employer Profile", field):
+            continue
+        frappe.db.sql(f"ALTER TABLE `tabEmployer Profile` ADD COLUMN `{field}` {column_type}")
+        added = True
+    if added:
+        frappe.db.commit()
+        frappe.cache.hdel("table_columns", "tabEmployer Profile")
+
+
 @frappe.whitelist(allow_guest=False)
 def update_employer_profile(user: str, data: dict) -> dict:
     """
     Update an Employer Profile by user email using direct SQL SET.
     Ignores protected system fields. Creates the profile if it doesn't exist.
     """
+    if isinstance(data, str):
+        data = frappe.parse_json(data)
+    if not isinstance(data, dict):
+        frappe.throw("Profile data must be a set of fields.")
+
     PROTECTED = {
         'name', 'owner', 'creation', 'modified', 'modified_by',
         'docstatus', 'idx', 'user',
     }
 
+    _ensure_profile_columns()
     existing = frappe.db.sql(
         "SELECT name FROM `tabEmployer Profile` WHERE user = %s LIMIT 1",
         (user,)
