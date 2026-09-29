@@ -21,8 +21,44 @@ DOCUMENT_TYPES = (
 PAYMENT_METHODS = ("EcoCash", "Bank Transfer", "Paynow", "Cash")
 
 
+def _ensure_unicode_collation():
+    """Portal tables created without a collation pick up utf8mb4_general_ci.
+    Frappe tables use utf8mb4_unicode_ci, and MariaDB rejects comparing the two.
+    """
+    tables = (
+        "tabEmployer Profile",
+        "tabCandidate Profile",
+        "tabEmployer Membership",
+        "tabEmployer Document",
+        "tabEmployer Information Request",
+        "tabEmployer Subscription",
+        "tabJob Alert",
+        "tabSaved Job",
+        "tabPortal Notification",
+        "tabCareer Resource",
+        "tabResource Download",
+        "tabResource Payment",
+        "tabSponsor Slot",
+    )
+    for table in tables:
+        mismatched = frappe.db.sql(
+            """SELECT COUNT(*) FROM information_schema.COLUMNS
+               WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s
+                 AND COLLATION_NAME IS NOT NULL
+                 AND COLLATION_NAME <> 'utf8mb4_unicode_ci'""",
+            (table,),
+        )[0][0]
+        if not mismatched:
+            continue
+        frappe.db.sql(
+            "ALTER TABLE `{0}` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci".format(table)
+        )
+    frappe.db.commit()
+
+
 def ensure_review_doctypes():
     """Create the review DocTypes once. Safe to call on every request."""
+    _ensure_unicode_collation()
     if frappe.db.exists("DocType", "Employer Subscription"):
         return
     # Only Administrator may grant the Portal Administrator role on a custom DocType.
@@ -145,12 +181,33 @@ def _requests(profile_name):
 
 
 def _ensure_subscription_proof_columns():
-    """Cash payments store the receipt on the subscription row."""
-    if frappe.db.has_column("Employer Subscription", "proof_file_url"):
-        return
-    frappe.db.sql("ALTER TABLE `tabEmployer Subscription` ADD COLUMN `proof_file_url` varchar(500)")
-    frappe.db.sql("ALTER TABLE `tabEmployer Subscription` ADD COLUMN `proof_file_name` varchar(140)")
-    frappe.db.commit()
+    """Cash payments store the receipt on the subscription row.
+
+    has_column uses a cached column list, so it can miss a column that is
+    already in the table and the following ALTER then fails with 1060.
+    """
+    columns = {
+        "proof_file_url": "varchar(500)",
+        "proof_file_name": "varchar(140)",
+    }
+    added = False
+    for field, column_type in columns.items():
+        exists = frappe.db.sql(
+            """SELECT COUNT(*) FROM information_schema.COLUMNS
+               WHERE TABLE_SCHEMA = DATABASE()
+                 AND TABLE_NAME = 'tabEmployer Subscription'
+                 AND COLUMN_NAME = %s""",
+            (field,),
+        )[0][0]
+        if exists:
+            continue
+        frappe.db.sql(
+            "ALTER TABLE `tabEmployer Subscription` ADD COLUMN `{0}` {1}".format(field, column_type)
+        )
+        added = True
+    if added:
+        frappe.db.commit()
+    frappe.cache.hdel("table_columns", "tabEmployer Subscription")
 
 
 def _latest_subscription(profile_name):
@@ -208,22 +265,29 @@ def _employer_filters(status="", search=""):
     filters = []
     params = []
     if status in ("Pending", "Verified", "Rejected", "Suspended"):
-        filters.append("p.verification_status = %s")
+        filters.append("p.verification_status COLLATE utf8mb4_unicode_ci = %s")
         params.append(status)
     elif status == "Awaiting payment":
         filters.append(
-            """IFNULL((SELECT s.status FROM `tabEmployer Subscription` s
-               WHERE s.profile = p.name ORDER BY s.creation DESC LIMIT 1), 'None') != 'Paid'"""
+            """IFNULL((SELECT s.status COLLATE utf8mb4_unicode_ci FROM `tabEmployer Subscription` s
+               WHERE s.profile COLLATE utf8mb4_unicode_ci = p.name COLLATE utf8mb4_unicode_ci
+               ORDER BY s.creation DESC LIMIT 1), 'None') != 'Paid'"""
         )
     elif status == "Information requested":
         filters.append(
             """(SELECT COUNT(*) FROM `tabEmployer Information Request` r
-               WHERE r.profile = p.name AND r.status = 'Open') > 0"""
+               WHERE r.profile COLLATE utf8mb4_unicode_ci = p.name COLLATE utf8mb4_unicode_ci
+                 AND r.status COLLATE utf8mb4_unicode_ci = 'Open') > 0"""
         )
     if search:
         safe = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         like = "%{0}%".format(safe)
-        filters.append("(p.company_name LIKE %s OR p.email LIKE %s OR p.user LIKE %s OR p.industry LIKE %s)")
+        filters.append(
+            "(p.company_name COLLATE utf8mb4_unicode_ci LIKE %s "
+            "OR p.email COLLATE utf8mb4_unicode_ci LIKE %s "
+            "OR p.user COLLATE utf8mb4_unicode_ci LIKE %s "
+            "OR p.industry COLLATE utf8mb4_unicode_ci LIKE %s)"
+        )
         params.extend([like, like, like, like])
     where = ("WHERE " + " AND ".join(filters)) if filters else ""
     return where, params
@@ -252,13 +316,17 @@ def list_employers_for_review(status="", search="", limit=20, page=1):
         SELECT p.name, p.user, p.company_name, p.email, p.phone, p.industry,
                p.city, p.country, p.verification_status, p.creation,
                p.onboarding_completed, p.company, p.duplicate_flag, p.duplicate_reason,
-               (SELECT COUNT(*) FROM `tabEmployer Document` d WHERE d.profile = p.name) AS document_count,
+               (SELECT COUNT(*) FROM `tabEmployer Document` d
+                 WHERE d.profile COLLATE utf8mb4_unicode_ci = p.name COLLATE utf8mb4_unicode_ci) AS document_count,
                (SELECT COUNT(*) FROM `tabEmployer Information Request` r
-                 WHERE r.profile = p.name AND r.status = 'Open') AS open_requests,
-               (SELECT s.status FROM `tabEmployer Subscription` s
-                 WHERE s.profile = p.name ORDER BY s.creation DESC LIMIT 1) AS subscription_status,
-               (SELECT s.plan FROM `tabEmployer Subscription` s
-                 WHERE s.profile = p.name ORDER BY s.creation DESC LIMIT 1) AS subscription_plan
+                 WHERE r.profile COLLATE utf8mb4_unicode_ci = p.name COLLATE utf8mb4_unicode_ci
+                   AND r.status COLLATE utf8mb4_unicode_ci = 'Open') AS open_requests,
+               (SELECT s.status COLLATE utf8mb4_unicode_ci FROM `tabEmployer Subscription` s
+                 WHERE s.profile COLLATE utf8mb4_unicode_ci = p.name COLLATE utf8mb4_unicode_ci
+                 ORDER BY s.creation DESC LIMIT 1) AS subscription_status,
+               (SELECT s.plan COLLATE utf8mb4_unicode_ci FROM `tabEmployer Subscription` s
+                 WHERE s.profile COLLATE utf8mb4_unicode_ci = p.name COLLATE utf8mb4_unicode_ci
+                 ORDER BY s.creation DESC LIMIT 1) AS subscription_plan
         FROM `tabEmployer Profile` p
         {where}
         ORDER BY p.creation DESC
@@ -270,14 +338,16 @@ def list_employers_for_review(status="", search="", limit=20, page=1):
     counts = frappe.db.sql(
         """
         SELECT COUNT(*) AS all_count,
-               SUM(p.verification_status = 'Pending') AS pending,
-               SUM(p.verification_status = 'Verified') AS verified,
-               SUM(p.verification_status = 'Rejected') AS rejected,
-               SUM(p.verification_status = 'Suspended') AS suspended,
-               SUM(IFNULL((SELECT s.status FROM `tabEmployer Subscription` s
-                    WHERE s.profile = p.name ORDER BY s.creation DESC LIMIT 1), 'None') != 'Paid') AS awaiting_payment,
+               SUM(p.verification_status COLLATE utf8mb4_unicode_ci = 'Pending') AS pending,
+               SUM(p.verification_status COLLATE utf8mb4_unicode_ci = 'Verified') AS verified,
+               SUM(p.verification_status COLLATE utf8mb4_unicode_ci = 'Rejected') AS rejected,
+               SUM(p.verification_status COLLATE utf8mb4_unicode_ci = 'Suspended') AS suspended,
+               SUM(IFNULL((SELECT s.status COLLATE utf8mb4_unicode_ci FROM `tabEmployer Subscription` s
+                    WHERE s.profile COLLATE utf8mb4_unicode_ci = p.name COLLATE utf8mb4_unicode_ci
+                    ORDER BY s.creation DESC LIMIT 1), 'None') != 'Paid') AS awaiting_payment,
                SUM((SELECT COUNT(*) FROM `tabEmployer Information Request` r
-                    WHERE r.profile = p.name AND r.status = 'Open') > 0) AS information_requested
+                    WHERE r.profile COLLATE utf8mb4_unicode_ci = p.name COLLATE utf8mb4_unicode_ci
+                      AND r.status COLLATE utf8mb4_unicode_ci = 'Open') > 0) AS information_requested
         FROM `tabEmployer Profile` p
         {where}
         """.format(where=count_where),

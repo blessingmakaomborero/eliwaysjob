@@ -26,12 +26,14 @@ def execute():
               `country`             varchar(140) DEFAULT NULL,
               `city`                varchar(140) DEFAULT NULL,
               `verification_status` varchar(50) DEFAULT 'Pending',
+              `verification_date`   datetime(6) DEFAULT NULL,
+              `verified_by`         varchar(140) DEFAULT NULL,
               `onboarding_completed` int(1) DEFAULT 0,
               `onboarding_step`     int(8) DEFAULT 1,
               `duplicate_flag`      int(1) DEFAULT 0,
               PRIMARY KEY (`name`),
               KEY `modified` (`modified`)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
         "tabCandidate Profile": """
             CREATE TABLE IF NOT EXISTS `tabCandidate Profile` (
@@ -54,7 +56,7 @@ def execute():
               `profile_complete` int(1) DEFAULT 0,
               PRIMARY KEY (`name`),
               KEY `modified` (`modified`)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
         "tabEmployer Membership": """
             CREATE TABLE IF NOT EXISTS `tabEmployer Membership` (
@@ -73,7 +75,7 @@ def execute():
               `invited_by`       varchar(140) DEFAULT NULL,
               PRIMARY KEY (`name`),
               KEY `modified` (`modified`)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
         "tabJob Alert": """
             CREATE TABLE IF NOT EXISTS `tabJob Alert` (
@@ -93,7 +95,7 @@ def execute():
               `last_sent`       date DEFAULT NULL,
               PRIMARY KEY (`name`),
               KEY `modified` (`modified`)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
         "tabSaved Job": """
             CREATE TABLE IF NOT EXISTS `tabSaved Job` (
@@ -108,7 +110,7 @@ def execute():
               `job_opening` varchar(140) DEFAULT NULL,
               PRIMARY KEY (`name`),
               KEY `modified` (`modified`)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
         "tabPortal Notification": """
             CREATE TABLE IF NOT EXISTS `tabPortal Notification` (
@@ -127,7 +129,7 @@ def execute():
               `link`        varchar(255) DEFAULT NULL,
               PRIMARY KEY (`name`),
               KEY `modified` (`modified`)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
     }
 

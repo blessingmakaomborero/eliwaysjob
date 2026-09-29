@@ -550,6 +550,8 @@ def update_employer_verification(profile_name: str, status: str, notes: str = ""
     if status not in allowed:
         frappe.throw(f"Invalid status: {status}")
 
+    _ensure_profile_columns()
+
     # Use direct SQL to avoid 'No module named frappe.core.doctype.employer_profile'
     # which occurs when frappe.get_doc tries to load a Python controller for a custom DocType
     exists = frappe.db.sql(
@@ -926,6 +928,8 @@ PROFILE_COLUMNS = {
     "logo": "varchar(255)",
     "duplicate_flag": "int(1) NOT NULL DEFAULT 0",
     "duplicate_reason": "text",
+    "verification_date": "datetime(6) DEFAULT NULL",
+    "verified_by": "varchar(140) DEFAULT NULL",
 }
 
 
@@ -933,9 +937,16 @@ def _ensure_profile_columns():
     """The portal table was created without the onboarding columns. Add any that are missing."""
     added = False
     for field, column_type in PROFILE_COLUMNS.items():
-        if frappe.db.has_column("Employer Profile", field):
+        exists = frappe.db.sql(
+            """SELECT COUNT(*) FROM information_schema.COLUMNS
+               WHERE TABLE_SCHEMA = DATABASE()
+                 AND TABLE_NAME = 'tabEmployer Profile'
+                 AND COLUMN_NAME = %s""",
+            (field,),
+        )[0][0]
+        if exists:
             continue
-        frappe.db.sql(f"ALTER TABLE `tabEmployer Profile` ADD COLUMN `{field}` {column_type}")
+        frappe.db.sql("ALTER TABLE `tabEmployer Profile` ADD COLUMN `{0}` {1}".format(field, column_type))
         added = True
     if added:
         frappe.db.commit()
@@ -1216,6 +1227,84 @@ def set_notification_prefs(user_email: str, prefs) -> dict:
     )
     frappe.db.commit()
     return values
+
+
+@frappe.whitelist(allow_guest=False)
+def list_portal_candidates(limit=20, page=1):
+    """Job Seeker accounts for the admin list. SQL avoids DocType permission checks."""
+    try:
+        page_no = max(1, int(page or 1))
+    except (TypeError, ValueError):
+        page_no = 1
+    try:
+        page_size = min(50, max(1, int(limit or 20)))
+    except (TypeError, ValueError):
+        page_size = 20
+
+    where = """
+        FROM `tabUser` u
+        WHERE u.name IN (
+            SELECT parent FROM `tabHas Role`
+            WHERE parenttype = 'User' AND role = 'Job Seeker'
+        )
+          AND u.name NOT IN ('Guest', 'Administrator')
+    """
+    total = frappe.db.sql("SELECT COUNT(*) " + where)[0][0]
+    rows = frappe.db.sql(
+        """
+        SELECT u.name, u.full_name, u.first_name, u.last_name,
+               IFNULL(NULLIF(u.email, ''), u.name) AS email, u.creation
+        """ + where + """
+        ORDER BY u.creation DESC
+        LIMIT %s OFFSET %s
+        """,
+        (page_size, (page_no - 1) * page_size),
+        as_dict=True,
+    )
+    places = _candidate_places([row.name for row in rows])
+    data = []
+    for row in rows:
+        place = places.get(row.name, {})
+        display = (row.full_name or "").strip() or " ".join(
+            part for part in ((row.first_name or "").strip(), (row.last_name or "").strip()) if part
+        ) or row.email
+        data.append({
+            "id": row.name,
+            "name": display,
+            "email": row.email,
+            "location": ", ".join(part for part in (place.get("city"), place.get("country")) if part),
+            "creation": row.creation,
+        })
+    return {
+        "data": data,
+        "total": int(total or 0),
+        "page": page_no,
+        "page_size": page_size,
+    }
+
+
+def _candidate_places(emails):
+    if not emails or not frappe.db.table_exists("Candidate Profile"):
+        return {}
+    columns = {row[0] for row in frappe.db.sql("SHOW COLUMNS FROM `tabCandidate Profile`")}
+    if "user" not in columns:
+        return {}
+    city = "city" if "city" in columns else ("location" if "location" in columns else None)
+    country = "country" if "country" in columns else None
+    selected = ["`user`"]
+    if city:
+        selected.append("`{0}` AS city".format(city))
+    if country:
+        selected.append("`country`")
+    placeholders = ", ".join(["%s"] * len(emails))
+    rows = frappe.db.sql(
+        "SELECT {0} FROM `tabCandidate Profile` WHERE user IN ({1})".format(
+            ", ".join(selected), placeholders
+        ),
+        tuple(emails),
+        as_dict=True,
+    )
+    return {row.user: row for row in rows}
 
 
 @frappe.whitelist(allow_guest=True)
