@@ -752,19 +752,36 @@ def create_employer_profile(user: str, company_name: str, email: str,
         return {"name": existing[0][0], "created": False}
 
     duplicate, reason = _probable_duplicate(company_name, email)
-    _ensure_duplicate_flag()
+    _ensure_profile_columns()
 
     import secrets as _secrets
     name = _secrets.token_urlsafe(8)
+    columns = set(frappe.db.get_table_columns("Employer Profile"))
+    row = {
+        "name": name,
+        "owner": "Administrator",
+        "modified_by": "Administrator",
+        "docstatus": 0,
+        "user": user,
+        "company_name": company_name,
+        "email": email,
+        "phone": phone,
+        "industry": industry,
+        "website": website,
+        "country": country,
+        "city": city,
+        "verification_status": "Pending",
+        "onboarding_completed": 0,
+        "onboarding_step": 1,
+        "duplicate_flag": duplicate,
+        "duplicate_reason": reason,
+    }
+    usable = {key: value for key, value in row.items() if key in columns}
+    col_sql = ", ".join(f"`{key}`" for key in usable)
+    val_sql = ", ".join(["%s"] * len(usable))
     frappe.db.sql(
-        """INSERT INTO `tabEmployer Profile`
-           (name, owner, creation, modified, modified_by, docstatus,
-            user, company_name, email, phone, industry, website,
-            country, city, verification_status, onboarding_completed, onboarding_step,
-            duplicate_flag, duplicate_reason)
-           VALUES (%s, 'Administrator', NOW(), NOW(), 'Administrator', 0,
-                   %s, %s, %s, %s, %s, %s, %s, %s, 'Pending', 0, 1, %s, %s)""",
-        (name, user, company_name, email, phone, industry, website, country, city, duplicate, reason)
+        f"INSERT INTO `tabEmployer Profile` ({col_sql}, creation, modified) VALUES ({val_sql}, NOW(), NOW())",
+        list(usable.values()),
     )
     frappe.db.commit()
     return {"name": name, "created": True, "duplicate_flag": duplicate, "duplicate_reason": reason}
@@ -907,6 +924,8 @@ PROFILE_COLUMNS = {
     "interview_notify_emails": "text",
     "offer_notify_emails": "text",
     "logo": "varchar(255)",
+    "duplicate_flag": "int(1) NOT NULL DEFAULT 0",
+    "duplicate_reason": "text",
 }
 
 
@@ -945,7 +964,24 @@ def update_employer_profile(user: str, data: dict) -> dict:
         (user,)
     )
     if not existing:
-        return {"error": "Profile not found for user: " + user}
+        created = create_employer_profile(
+            user=user,
+            company_name=data.get("company_name") or "",
+            email=data.get("email") or user,
+            phone=data.get("phone") or "",
+            industry=data.get("industry") or "",
+            website=data.get("website") or "",
+            country=data.get("country") or "",
+            city=data.get("city") or "",
+        )
+        if not created or created.get("error"):
+            return {"error": (created or {}).get("error") or "Could not create the employer profile."}
+        existing = frappe.db.sql(
+            "SELECT name FROM `tabEmployer Profile` WHERE user = %s LIMIT 1",
+            (user,),
+        )
+        if not existing:
+            return {"error": "Could not create the employer profile."}
 
     profile_name = existing[0][0]
     columns = set(frappe.db.get_table_columns("Employer Profile"))
